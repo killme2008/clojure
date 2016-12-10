@@ -27,33 +27,12 @@
   [^StackTraceElement el]
   (.getClassName el))
 
-(def ^:private demunge-map
-  (into {"$" "/"} (map (fn [[k v]] [v k]) clojure.lang.Compiler/CHAR_MAP)))
-
-(def ^:private demunge-pattern
-  (re-pattern (apply str (interpose "|" (map #(str "\\Q" % "\\E")
-                                             (keys demunge-map))))))
-
-(defn- re-replace [re s f]
-  (let [m (re-matcher re s)
-        mseq (take-while identity
-                         (repeatedly #(when (re-find m)
-                                        [(re-groups m) (.start m) (.end m)])))]
-    (apply str
-           (concat
-             (mapcat (fn [[_ _ start] [groups end]]
-                       (if end
-                         [(subs s start end) (f groups)]
-                         [(subs s start)]))
-                     (cons [0 0 0] mseq)
-                     (concat mseq [nil]))))))
-
 (defn demunge
   "Given a string representation of a fn class,
   as in a stack trace element, returns a readable version."
   {:added "1.3"}
   [fn-name]
-  (re-replace demunge-pattern fn-name demunge-map))
+  (clojure.lang.Compiler/demunge fn-name))
 
 (defn root-cause
   "Returns the initial cause of an exception or error by peeling off all of
@@ -74,6 +53,7 @@
   [^StackTraceElement el]
   (let [file (.getFileName el)
         clojure-fn? (and file (or (.endsWith file ".clj")
+                                  (.endsWith file ".cljc")
                                   (= file "NO_SOURCE_FILE")))]
     (str (if clojure-fn?
            (demunge (.getClassName el))
@@ -94,11 +74,14 @@
              *print-meta* *print-meta*
              *print-length* *print-length*
              *print-level* *print-level*
+             *print-namespace-maps* true
              *data-readers* *data-readers*
+             *default-data-reader-fn* *default-data-reader-fn*
              *compile-path* (System/getProperty "clojure.compile.path" "classes")
              *command-line-args* *command-line-args*
              *unchecked-math* *unchecked-math*
              *assert* *assert*
+             clojure.spec/*explain-out* clojure.spec/*explain-out*
              *1 nil
              *2 nil
              *3 nil
@@ -156,7 +139,7 @@
   [request-prompt request-exit]
   (or ({:line-start request-prompt :stream-end request-exit}
        (skip-whitespace *in*))
-      (let [input (read)]
+      (let [input (read {:read-cond :allow} *in*)]
         (skip-if-eol *in*)
         input)))
 
@@ -182,6 +165,13 @@ by default when a new command-line REPL is started."} repl-requires
   '[[clojure.repl :refer (source apropos dir pst doc find-doc)]
     [clojure.java.javadoc :refer (javadoc)]
     [clojure.pprint :refer (pp pprint)]])
+
+(defmacro with-read-known
+  "Evaluates body with *read-eval* set to a \"known\" value,
+   i.e. substituting true for :unknown if necessary."
+  [& body]
+  `(binding [*read-eval* (if (= :unknown *read-eval*) true *read-eval*)]
+     ~@body))
 
 (defn repl
   "Generic, reusable, read-eval-print loop. By default, reads from *in*,
@@ -216,7 +206,7 @@ by default when a new command-line REPL is started."} repl-requires
          - else returns the next object read from the input stream
        default: repl-read
 
-     - :eval, funtion of one argument, returns the evaluation of its
+     - :eval, function of one argument, returns the evaluation of its
        argument
        default: eval
 
@@ -246,9 +236,10 @@ by default when a new command-line REPL is started."} repl-requires
         read-eval-print
         (fn []
           (try
-           (let [input (read request-prompt request-exit)]
+            (let [read-eval *read-eval*
+                  input (with-read-known (read request-prompt request-exit))]
              (or (#{request-prompt request-exit} input)
-                 (let [value (eval input)]
+                 (let [value (binding [*read-eval* read-eval] (eval input))]
                    (print value)
                    (set! *3 *2)
                    (set! *2 *1)
@@ -295,12 +286,12 @@ by default when a new command-line REPL is started."} repl-requires
   [str]
   (let [eof (Object.)
         reader (LineNumberingPushbackReader. (java.io.StringReader. str))]
-      (loop [input (read reader false eof)]
+      (loop [input (with-read-known (read reader false eof))]
         (when-not (= input eof)
           (let [value (eval input)]
             (when-not (nil? value)
               (prn value))
-            (recur (read reader false eof)))))))
+            (recur (with-read-known (read reader false eof))))))))
 
 (defn- init-dispatch
   "Returns the handler associated with an init opt"
@@ -404,7 +395,7 @@ java -cp clojure.jar clojure.main -i init.clj script.clj args...")
   main options:
     -m, --main ns-name  Call the -main function from a namespace with args
     -r, --repl          Run a repl
-    path                Run a script from from a file or resource
+    path                Run a script from a file or resource
     -                   Run a script from standard input
     -h, -?, --help      Print this help message and exit
 
